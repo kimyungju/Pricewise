@@ -33,3 +33,31 @@ async def test_create_two_sessions_different_ids(client):
     r1 = await client.post("/chat/sessions")
     r2 = await client.post("/chat/sessions")
     assert r1.json()["session_id"] != r2.json()["session_id"]
+
+
+@pytest.mark.asyncio
+async def test_send_message_invalid_session(client):
+    response = await client.post(
+        "/chat/sessions/nonexistent/messages",
+        json={"content": "Hello"},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_send_message_returns_sse_stream(client):
+    # Create session first
+    session_resp = await client.post("/chat/sessions")
+    session_id = session_resp.json()["session_id"]
+
+    # Send message — should get SSE stream back
+    response = await client.post(
+        f"/chat/sessions/{session_id}/messages",
+        json={"content": "Hello"},
+    )
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    # Should contain at least a done or error event
+    assert "event: done" in response.text or "event: error" in response.text
+
+
