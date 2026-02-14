@@ -33,7 +33,7 @@ async def main():
     # interrupt/resume flow for human-in-the-loop approval.
     config = {"configurable": {"thread_id": "demo-session-1"}}
 
-    user_query = "Find me the best wireless headphones under $100"
+    user_query = "Find me wireless headphones under $100, compare prices, check reviews, and calculate total with 8% tax"
     print(f"\nUser: {user_query}\n")
 
     # First invocation: the agent reasons and decides to call SearchProduct.
