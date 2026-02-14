@@ -16,7 +16,7 @@ from aigent.tools import search_product, compare_prices, get_reviews, calculate_
 from aigent.middleware.summarization import create_summarization_hook
 
 
-def build_agent():
+def build_agent(checkpointer=None):
     """Build and return the compiled agent graph.
 
     The agent:
@@ -27,7 +27,8 @@ def build_agent():
       5. Returns a structured Receipt as its final output (response_format)
     """
     model = init_chat_model("gpt-4o", model_provider="openai")
-    checkpointer = InMemorySaver()
+    if checkpointer is None:
+        checkpointer = InMemorySaver()
 
     # Summarization hook: compresses history when messages exceed threshold
     summarization_hook = create_summarization_hook(model, max_messages=5)
