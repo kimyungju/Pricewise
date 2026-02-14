@@ -12,7 +12,7 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import InMemorySaver
 
 from aigent.schemas import Receipt
-from aigent.tools import search_product
+from aigent.tools import search_product, compare_prices, get_reviews, calculate_budget
 from aigent.middleware.summarization import create_summarization_hook
 
 
@@ -34,7 +34,7 @@ def build_agent():
 
     agent = create_react_agent(
         model=model,
-        tools=[search_product],
+        tools=[search_product, compare_prices, get_reviews, calculate_budget],
         checkpointer=checkpointer,
         pre_model_hook=summarization_hook,
         interrupt_before=["tools"],  # HITL: pause before tool execution

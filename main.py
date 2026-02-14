@@ -68,6 +68,12 @@ async def main():
         print("\n=== Final Receipt ===")
         print(f"  Product: {receipt.product_name}")
         print(f"  Price:   {receipt.price} {receipt.currency}")
+        if receipt.average_rating is not None:
+            print(f"  Rating:  {receipt.average_rating}/5")
+        if receipt.price_range:
+            print(f"  Range:   {receipt.price_range}")
+        if receipt.recommendation_reason:
+            print(f"  Reason:  {receipt.recommendation_reason}")
         print("=====================")
     else:
         # Fallback: print the last agent message
