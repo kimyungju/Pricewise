@@ -13,6 +13,10 @@ class MessageRequest(BaseModel):
     content: str
 
 
+class ApprovalRequest(BaseModel):
+    approved: bool
+
+
 def _get_session(request: Request, session_id: str) -> dict:
     """Look up a session or raise 404."""
     sessions = request.app.state.sessions
@@ -92,3 +96,24 @@ async def send_message(session_id: str, body: MessageRequest, request: Request):
     )
 
 
+@router.post("/sessions/{session_id}/approve")
+async def approve_tool(session_id: str, body: ApprovalRequest, request: Request):
+    """Approve or deny pending tool calls, then stream the rest of the response."""
+    session = _get_session(request, session_id)
+    agent = request.app.state.agent
+    config = {"configurable": {"thread_id": session["thread_id"]}}
+
+    if not body.approved:
+        async def denied_stream():
+            yield format_sse_event("error", {"message": "Tool execution denied by user"})
+            yield format_sse_event("done", {})
+
+        return StreamingResponse(
+            denied_stream(),
+            media_type="text/event-stream",
+        )
+
+    return StreamingResponse(
+        _stream_agent(agent, config, None),
+        media_type="text/event-stream",
+    )

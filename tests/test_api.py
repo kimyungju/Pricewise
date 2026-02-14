@@ -61,3 +61,23 @@ async def test_send_message_returns_sse_stream(client):
     assert "event: done" in response.text or "event: error" in response.text
 
 
+@pytest.mark.asyncio
+async def test_approve_invalid_session(client):
+    response = await client.post(
+        "/chat/sessions/nonexistent/approve",
+        json={"approved": True},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_approve_endpoint_exists(client):
+    session_resp = await client.post("/chat/sessions")
+    session_id = session_resp.json()["session_id"]
+    response = await client.post(
+        f"/chat/sessions/{session_id}/approve",
+        json={"approved": True},
+    )
+    # Should return SSE stream (even if agent has nothing to resume)
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
