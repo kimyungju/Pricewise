@@ -20,11 +20,16 @@ async function readSSEStream(
     onToolResult: (name: string, result: string) => void;
     onDone: () => void;
     onError: (message: string) => void;
-  }
+  },
+  signal?: AbortSignal
 ) {
   const reader = response.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+
+  if (signal) {
+    signal.addEventListener("abort", () => reader.cancel(), { once: true });
+  }
 
   while (true) {
     const { done, value } = await reader.read();
@@ -147,6 +152,7 @@ export function useChatStream() {
   const [status, setStatus] = useState<ChatStatus>("idle");
   const [sessionId, setSessionId] = useState<string | null>(null);
   const initializedRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
 
   // Rehydrate session from localStorage on mount
   useEffect(() => {
@@ -154,43 +160,47 @@ export function useChatStream() {
     initializedRef.current = true;
 
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
-      setSessionId(stored);
-      fetch(`${API_BASE}/sessions/${stored}/messages`)
-        .then((res) => {
-          if (res.ok) return res.json();
-          localStorage.removeItem(STORAGE_KEY);
-          return null;
-        })
-        .then((data) => {
-          if (data?.messages?.length) {
-            const hydrated: ChatMessage[] = data.messages.map(
-              (m: { id: string; role: string; content: string; toolCalls?: ToolCall[] }) => ({
-                id: m.id || generateId(),
-                role: m.role as "user" | "assistant",
-                content: m.content,
-                toolCalls: m.toolCalls,
-              })
-            );
-            if (data.receipt) {
-              for (let i = hydrated.length - 1; i >= 0; i--) {
-                if (hydrated[i].role === "assistant") {
-                  hydrated[i] = { ...hydrated[i], receipt: data.receipt };
-                  break;
-                }
+    if (!stored) return;
+
+    const controller = new AbortController();
+    setSessionId(stored);
+    fetch(`${API_BASE}/sessions/${stored}/messages`, { signal: controller.signal })
+      .then((res) => {
+        if (res.ok) return res.json();
+        localStorage.removeItem(STORAGE_KEY);
+        return null;
+      })
+      .then((data) => {
+        if (data?.messages?.length) {
+          const hydrated: ChatMessage[] = data.messages.map(
+            (m: { id: string; role: string; content: string; toolCalls?: ToolCall[] }) => ({
+              id: m.id || generateId(),
+              role: m.role as "user" | "assistant",
+              content: m.content,
+              toolCalls: m.toolCalls,
+            })
+          );
+          if (data.receipt) {
+            for (let i = hydrated.length - 1; i >= 0; i--) {
+              if (hydrated[i].role === "assistant") {
+                hydrated[i] = { ...hydrated[i], receipt: data.receipt };
+                break;
               }
             }
-            setMessages(hydrated);
           }
-        })
-        .catch(() => {
-          localStorage.removeItem(STORAGE_KEY);
-        });
-    }
+          setMessages(hydrated);
+        }
+      })
+      .catch((err) => {
+        if (err.name === "AbortError") return;
+        localStorage.removeItem(STORAGE_KEY);
+      });
+
+    return () => controller.abort();
   }, []);
 
-  const createSession = useCallback(async () => {
-    const resp = await fetch(`${API_BASE}/sessions`, { method: "POST" });
+  const createSession = useCallback(async (signal?: AbortSignal) => {
+    const resp = await fetch(`${API_BASE}/sessions`, { method: "POST", signal });
     const data = await resp.json();
     setSessionId(data.session_id);
     localStorage.setItem(STORAGE_KEY, data.session_id);
@@ -198,6 +208,8 @@ export function useChatStream() {
   }, []);
 
   const clearSession = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
     localStorage.removeItem(STORAGE_KEY);
     setSessionId(null);
     setMessages([]);
@@ -206,33 +218,44 @@ export function useChatStream() {
 
   const sendMessage = useCallback(
     async (content: string) => {
-      let sid = sessionId;
-      if (!sid) {
-        sid = await createSession();
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        let sid = sessionId;
+        if (!sid) {
+          sid = await createSession(controller.signal);
+        }
+
+        const userMsg: ChatMessage = { id: generateId(), role: "user", content };
+        const assistantId = generateId();
+        const assistantMsg: ChatMessage = {
+          id: assistantId,
+          role: "assistant",
+          content: "",
+          isStreaming: true,
+        };
+
+        setMessages((prev) => [...prev, userMsg, assistantMsg]);
+        setStatus("streaming");
+
+        const response = await fetch(`${API_BASE}/sessions/${sid}/messages`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content }),
+          signal: controller.signal,
+        });
+
+        await readSSEStream(
+          response,
+          createSSEHandlers(assistantId, setMessages, setStatus),
+          controller.signal
+        );
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") return;
+        throw err;
       }
-
-      const userMsg: ChatMessage = { id: generateId(), role: "user", content };
-      const assistantId = generateId();
-      const assistantMsg: ChatMessage = {
-        id: assistantId,
-        role: "assistant",
-        content: "",
-        isStreaming: true,
-      };
-
-      setMessages((prev) => [...prev, userMsg, assistantMsg]);
-      setStatus("streaming");
-
-      const response = await fetch(`${API_BASE}/sessions/${sid}/messages`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content }),
-      });
-
-      await readSSEStream(
-        response,
-        createSSEHandlers(assistantId, setMessages, setStatus)
-      );
     },
     [sessionId, createSession]
   );
@@ -241,39 +264,55 @@ export function useChatStream() {
     async (approved: boolean) => {
       if (!sessionId) return;
 
-      setStatus("streaming");
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
 
-      const assistantId = generateId();
-      const assistantMsg: ChatMessage = {
-        id: assistantId,
-        role: "assistant",
-        content: "",
-        isStreaming: true,
-      };
+      try {
+        setStatus("streaming");
 
-      setMessages((prev) => [
-        ...prev.map((m) =>
-          m.isApprovalRequired ? { ...m, isApprovalRequired: false } : m
-        ),
-        assistantMsg,
-      ]);
+        const assistantId = generateId();
+        const assistantMsg: ChatMessage = {
+          id: assistantId,
+          role: "assistant",
+          content: "",
+          isStreaming: true,
+        };
 
-      const response = await fetch(
-        `${API_BASE}/sessions/${sessionId}/approve`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ approved }),
-        }
-      );
+        setMessages((prev) => [
+          ...prev.map((m) =>
+            m.isApprovalRequired ? { ...m, isApprovalRequired: false } : m
+          ),
+          assistantMsg,
+        ]);
 
-      await readSSEStream(
-        response,
-        createSSEHandlers(assistantId, setMessages, setStatus)
-      );
+        const response = await fetch(
+          `${API_BASE}/sessions/${sessionId}/approve`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ approved }),
+            signal: controller.signal,
+          }
+        );
+
+        await readSSEStream(
+          response,
+          createSSEHandlers(assistantId, setMessages, setStatus),
+          controller.signal
+        );
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") return;
+        throw err;
+      }
     },
     [sessionId]
   );
+
+  // Abort in-flight requests on unmount
+  useEffect(() => {
+    return () => abortRef.current?.abort();
+  }, []);
 
   return { messages, status, sendMessage, approveToolCall, clearSession };
 }
