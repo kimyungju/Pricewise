@@ -11,6 +11,10 @@ from functools import wraps
 from langgraph.types import interrupt
 
 
+class ToolExecutionDenied(Exception):
+    """Raised when a human denies execution of a tool."""
+
+
 def with_approval(tool_fn):
     """Wrap a LangChain tool so it pauses for human approval before executing.
 
@@ -28,8 +32,13 @@ def with_approval(tool_fn):
 
     @wraps(original)
     def wrapper(*args, **kwargs):
-        # Pause the graph — the host loop must resume to continue.
-        interrupt({"tool": wrapped.name, "args": kwargs})
+        # Pause the graph — the host loop must resume with Command(resume=value).
+        # interrupt() returns the value passed via Command(resume=...).
+        approved = interrupt({"tool": wrapped.name, "args": kwargs})
+        if not approved:
+            raise ToolExecutionDenied(
+                f"User denied execution of tool '{wrapped.name}'"
+            )
         return original(*args, **kwargs)
 
     wrapped.func = wrapper
