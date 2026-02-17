@@ -8,11 +8,13 @@ PriceWise is an autonomous agent that handles the full product research workflow
 
 The system is built on LangGraph's ReAct architecture with a FastAPI streaming backend and a Next.js chat frontend. Key capabilities:
 
-- **Multi-tool orchestration** — seven tools (product search, price comparison, reviews, budget calculation, wishlist, URL scraping) composed into a single agent loop
+- **Multi-tool orchestration** — ten tools (product search, price comparison, reviews, budget calculation, wishlist, URL scraping, coupon/deal finder, availability checker, multi-product delegation) composed into a single agent loop
 - **Selective human-in-the-loop** — only tools that make external API calls pause for approval; pure-computation tools auto-execute
 - **Structured output** — every conversation ends with a typed Pydantic `Receipt`, not free-form text
 - **Real-time streaming** — SSE delivers token-by-token responses, tool call notifications, approval prompts, and final receipts to the browser as they happen
 - **Conversation summarization** — a pre-model hook compresses long conversations without mutating graph state
+- **Persistent checkpointing** — `AsyncPostgresSaver` keeps conversation state across server restarts, with `InMemorySaver` fallback for local dev
+- **Multi-product delegation** — a delegation tool fans out parallel Tavily searches across product categories via `ThreadPoolExecutor`, synthesizing results with budget tracking
 
 PriceWise targets anyone making a considered purchase — from students comparing laptops to professionals evaluating software subscriptions. The agent reduces a 30-minute multi-tab research session to a single conversation.
 
@@ -56,7 +58,9 @@ This project exists as both a functional product and an engineering demonstratio
           │  Tavily Tools    │            │  Local Tools      │
           │  (search, compare│            │  (budget calc,    │
           │   reviews, scrape│            │   wishlist)       │
-          │  with_approval() │            │   auto-execute    │
+          │   coupons, avail,│            │   auto-execute    │
+          │   delegation)    │            │                   │
+          │  with_approval() │            │                   │
           └──────────────────┘            └──────────────────┘
 ```
 
@@ -88,7 +92,7 @@ The interrupt state is only accessible through `state.tasks`, not from the messa
 
 Pydantic v2 models serve double duty: they define tool input schemas (enabling the LLM to generate valid arguments) and the structured output format. The `Receipt` model includes optional `comparison_products` and `comparison_summary` fields, allowing the same schema to handle both single-product lookups and multi-product comparisons without branching logic.
 
-Sessions are keyed by UUID and backed by `InMemorySaver`. Each session maps to a LangGraph thread ID, and the agent checkpoints its full state (messages, tool calls, pending interrupts) after every node execution.
+Sessions are keyed by UUID and backed by a configurable checkpointer — `AsyncPostgresSaver` for production (persists across restarts) or `InMemorySaver` for local dev. The choice is made at startup via a FastAPI `lifespan` async context manager that manages the Postgres connection pool. Each session maps to a LangGraph thread ID, and the agent checkpoints its full state (messages, tool calls, pending interrupts) after every node execution. On restart, `_get_session()` queries the checkpointer to rehydrate sessions that exist in Postgres but not yet in the in-memory registry.
 
 ## 3. Tech Stack Deep Dive
 
@@ -100,12 +104,13 @@ Sessions are keyed by UUID and backed by `InMemorySaver`. Each session maps to a
 | **Tavily** | Web search API | Purpose-built for LLM applications — returns clean, parsed content rather than raw HTML. Shared client factory (`get_tavily`) centralizes configuration | Smaller ecosystem than SerpAPI or Google Custom Search; rate limits require defensive error handling |
 | **Next.js 16 + React 19** | Frontend | App Router for server/client boundaries, `fetch` with `AbortController` for SSE lifecycle management | Full framework for what is currently a single-page chat UI — justified by session rehydration and planned feature expansion |
 | **Pydantic v2** | Schema validation | Dual-use as both tool input schemas (LLM argument validation) and structured output format (`response_format=Receipt`). Single source of truth for data contracts | Schema changes require coordination between agent output and frontend rendering |
+| **PostgreSQL + AsyncPostgresSaver** | Persistent checkpointing | LangGraph-native checkpoint backend with async connection pooling. Managed via FastAPI `lifespan` context — auto-creates tables on first run, cleans up on shutdown | Requires a running Postgres instance; `InMemorySaver` fallback simplifies local dev |
 
 ## 4. Technical Challenges & Solutions
 
 ### Challenge 1: Per-Tool Human Approval Without Global Interrupts
 
-**Constraint:** PriceWise has seven tools. Four make external API calls (search, compare, reviews, scrape) and must require human approval. Three are safe (budget calculation, wishlist add/get) and should auto-execute. LangGraph's built-in `interrupt_before=["tools"]` pauses before *every* tool call — there is no native mechanism for selective interruption.
+**Constraint:** PriceWise has ten tools. Seven make external API calls (search, compare, reviews, scrape, coupons, availability, delegation) and must require human approval. Three are safe (budget calculation, wishlist add/get) and should auto-execute. LangGraph's built-in `interrupt_before=["tools"]` pauses before *every* tool call — there is no native mechanism for selective interruption.
 
 **Why the naive approach fails:** Wrapping tool functions with a decorator is straightforward, but LangChain's `@tool` decorator produces `StructuredTool` objects, not plain functions. A naive `functools.wraps` wrapper loses the tool's `.name`, `.description`, and `.args_schema` — metadata the LLM relies on to generate valid tool calls.
 
@@ -191,25 +196,49 @@ The algorithm first skips past any `ToolMessage` entries at the split boundary. 
 
 **Tradeoff:** The backward walk can push the split point earlier than intended, summarizing more messages than necessary. For conversations where every turn involves tool calls, this means the "recent" window grows. The alternative — parsing tool-call IDs to match pairs explicitly — would be more precise but would couple the hook to LangChain's internal message ID format.
 
+### Challenge 4: Parallel Research Inside a Sync Tool Running in an Async Context
+
+**Constraint:** When a user asks "I need a laptop, monitor, and keyboard under $2000," the agent should research all three products in parallel. But LangGraph tools are synchronous functions, the Tavily client is synchronous, and the entire agent runs inside FastAPI's async event loop. You cannot call `asyncio.run()` or `asyncio.new_event_loop()` from within an already-running event loop without deadlocking.
+
+**Why async approaches fail:** The natural instinct is `asyncio.gather()` with `run_in_executor`, but that requires an async function — and `@tool`-decorated functions must be sync (LangGraph invokes them synchronously from the tools node). Creating a new event loop with `asyncio.new_event_loop()` risks conflicts with the outer FastAPI loop and is explicitly warned against in Python's asyncio documentation.
+
+**Solution:** Use `concurrent.futures.ThreadPoolExecutor` for thread-based parallelism:
+
+```python
+# src/pricewise/tools/delegate_research.py
+@tool(args_schema=DelegationQuery)
+def delegate_research(products: list, total_budget: float | None = None) -> str:
+    items = [ProductResearchItem(**p) if isinstance(p, dict) else p for p in products]
+
+    with ThreadPoolExecutor(max_workers=min(len(items), 5)) as pool:
+        futures = {pool.submit(_research_one, item): item for item in items}
+        results = [f.result() for f in as_completed(futures)]
+    # ... synthesize results
+```
+
+Each thread gets its own call stack and runs the synchronous Tavily client independently. The `ThreadPoolExecutor` context manager ensures clean shutdown even if one search fails. The worker cap (`min(len(items), 5)`) prevents excessive concurrent API calls.
+
+**Tradeoff:** Thread-based parallelism has higher overhead than async I/O and does not share the event loop's cooperative scheduling. For the typical case of 2–5 concurrent Tavily searches (each taking 500ms–2s), the thread overhead is negligible compared to network latency. A true async approach would require either an async Tavily client or LangGraph support for async tool functions — neither of which currently exists.
+
 ## 5. Impact & Future Roadmap
 
 ### Current State
 
-- Full product research pipeline: search, price comparison, reviews, budget calculation, and wishlist — orchestrated in a single conversation
+- Full product research pipeline: search, price comparison, reviews, budget calculation, wishlist, URL scraping, coupon/deal finding, availability checking, and multi-product delegation — orchestrated in a single conversation
 - Real-time streaming UI with per-token delivery, tool call visualization, approval prompts, and structured receipt rendering
-- Session persistence with rehydration — refreshing the browser restores the full conversation from the LangGraph checkpoint
-- Nine test modules covering schemas, tools, middleware, streaming format, and API integration with zero live API calls
+- Persistent checkpointing via `AsyncPostgresSaver` — conversations survive server restarts and rehydrate automatically. `InMemorySaver` fallback for local dev and tests via `USE_MEMORY_SAVER` env var
+- Multi-product delegation tool that fans out parallel Tavily searches across product categories via `ThreadPoolExecutor`, with budget tracking and result synthesis
+- Twelve test modules covering schemas, tools (including new tools), middleware, streaming format, and API integration with zero live API calls
 
 ### Scalability Considerations
 
-- `InMemorySaver` is adequate for single-process deployment but loses state on restart. Migration to a persistent checkpointer (PostgreSQL or Redis) requires changing one constructor argument in `build_agent()` — the rest of the architecture is checkpointer-agnostic
+- `AsyncPostgresSaver` provides persistent checkpointing with connection pooling managed via FastAPI's lifespan. The checkpointer interface is pluggable — swapping to Redis or another backend requires changing one factory call
 - The `ContextVar`-scoped wishlist handles concurrent sessions on a single event loop. Scaling beyond a single process requires moving wishlist state to an external store, following the same session-keyed pattern
+- The multi-product delegation tool parallelizes Tavily searches via `ThreadPoolExecutor` with a configurable worker cap. This avoids async event loop conflicts (Tavily's client is synchronous) while achieving concurrent I/O
 - SSE streaming is unidirectional by design. Adding real-time features (collaborative sessions, push notifications) would require upgrading to WebSockets, though the existing event format could be preserved
 
 ### Planned Features
 
-- **Persistent checkpointing** — replace `InMemorySaver` with `AsyncPostgresSaver` for cross-session conversation history. LangGraph's checkpointer interface makes this a drop-in swap with no changes to agent logic
-- **Additional tools** — coupon/deal finder, product availability checker, and multi-agent delegation for complex research tasks spanning multiple product categories
 - **Production deployment** — Docker containerization, CI/CD pipeline with automated testing, and cloud deployment with monitoring and structured logging
 
 The architecture is designed for this kind of extension. Each layer — LLM, tools, middleware, API, frontend — can evolve independently. Adding a tool requires a function, a Pydantic schema, and a one-line addition to the agent's tool list. Swapping LLM providers requires changing a single `init_chat_model` call. The complexity lives in the orchestration boundaries, not in the individual components.
