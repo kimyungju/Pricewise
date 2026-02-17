@@ -48,7 +48,10 @@ export default function Home() {
           borderBottom: "3px solid var(--accent)",
         }}
       >
-        <div className="flex items-center gap-4">
+        <button
+          onClick={clearSession}
+          className="flex items-center gap-4 transition-opacity duration-150 hover:opacity-80"
+        >
           <div
             className="flex h-9 w-9 items-center justify-center rounded-lg text-sm font-bold"
             style={{
@@ -59,7 +62,7 @@ export default function Home() {
           >
             a.
           </div>
-          <div>
+          <div className="text-left">
             <h1
               className="text-xl font-semibold tracking-tight"
               style={{
@@ -76,7 +79,7 @@ export default function Home() {
               Your shopping companion
             </p>
           </div>
-        </div>
+        </button>
         <div className="flex items-center gap-2">
           {messages.length > 0 && (
             <button
